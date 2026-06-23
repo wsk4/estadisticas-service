@@ -1,0 +1,116 @@
+name: CI/CD — estadisticas-service
+
+# Disparado por push a la rama deploy o por Git tag vX.Y.Z
+on:
+  push:
+    branches:
+      - deploy
+    tags:
+      - "v*.*.*"
+
+env:
+  AWS_REGION:      ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY:  ${{ secrets.ECR_REPOSITORY }}
+  EKS_CLUSTER:     ${{ secrets.EKS_CLUSTER }}
+
+jobs:
+  build-push-deploy:
+    name: Build → ECR → EKS
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      # ── 2. Credenciales AWS (temporales AWS Academy) ───────────────────────
+      - name: 2. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ── 3. Login a Amazon ECR ──────────────────────────────────────────────
+      - name: 3. Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── 4. Calcular tags de imagen ─────────────────────────────────────────
+      # Tres tags simultáneos: vX.Y.Z (si es tag), latest y SHA del commit
+      - name: 4. Calcular tags de imagen
+        id: tags
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO="${{ env.ECR_REPOSITORY }}"
+          SHA="${{ github.sha }}"
+          BASE="${REGISTRY}/${REPO}"
+
+          # Tag por SHA (siempre presente)
+          TAGS="${BASE}:${SHA}"
+
+          # Tag latest (siempre)
+          TAGS="${TAGS},${BASE}:latest"
+
+          # Tag semántico solo si el trigger es un Git tag vX.Y.Z
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="${TAGS},${BASE}:${VERSION}"
+          fi
+
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "image=${BASE}:${SHA}" >> $GITHUB_OUTPUT
+          echo "Tags a publicar: ${TAGS}"
+
+      # ── 5. Build de la imagen Docker ───────────────────────────────────────
+      - name: 5. Build de la imagen Docker
+        run: |
+          docker build \
+            --tag ${{ steps.tags.outputs.image }} \
+            --label "git-commit=${{ github.sha }}" \
+            --label "build-date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            .
+
+      # ── 6. Push a Amazon ECR (todos los tags) ─────────────────────────────
+      - name: 6. Push a Amazon ECR
+        run: |
+          IFS=',' read -ra TAG_LIST <<< "${{ steps.tags.outputs.tags }}"
+          for TAG in "${TAG_LIST[@]}"; do
+            docker tag ${{ steps.tags.outputs.image }} "${TAG}"
+            docker push "${TAG}"
+          done
+
+      # ── 7. Actualizar kubeconfig y desplegar en EKS ────────────────────────
+      - name: 7. Desplegar en EKS
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          sed -i \
+            "s|<AWS_ACCOUNT_ID>|${ACCOUNT_ID}|g; \
+             s|<REGION>|${{ env.AWS_REGION }}|g; \
+             s|:latest|:${IMAGE_TAG}|g" \
+            k8s/estadisticas-deployment.yaml
+
+          kubectl apply -f k8s/estadisticas-deployment.yaml
+          kubectl apply -f k8s/estadisticas-service.yaml
+
+          kubectl rollout status deployment/estadisticas-service --timeout=120s
+
+      # ── 8. Verificar despliegue ────────────────────────────────────────────
+      - name: 8. Verificar pods y HPA
+        run: |
+          echo "── Pods ──────────────────────────────────"
+          kubectl get pods -l app=estadisticas-service
+          echo "── HPA ───────────────────────────────────"
+          kubectl get hpa estadisticas-hpa
+          echo "── Imagen desplegada ─────────────────────"
+          kubectl get deployment estadisticas-service \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo ""
