@@ -100,7 +100,7 @@ jobs:
 
           kubectl apply -f k8s/estadisticas-deployment.yaml
           kubectl apply -f k8s/estadisticas-service.yaml
-          kubectl apply -f k8s/apuestas-hpa.yaml
+          kubectl apply -f k8s/estadisticas-hpa.yaml
 
 
           kubectl rollout status deployment/estadisticas-service --timeout=120s
